@@ -3,11 +3,21 @@ defmodule Chromecast do
     use GenServer
     use Protobuf, from: Path.expand("../proto/cast_channel.proto", __DIR__)
 
+    @ping "PING"
+    @pong "PONG"
+    @receiver_status "RECEIVER_STATUS"
+    @media_status "MEDIA_STATUS"
+
+
     defmodule State do
         defstruct media_session: nil,
             session: nil,
-            destination_id: nil,
-            ssl: nil
+            destination_id: "receiver-0",
+            ssl: nil,
+            ip: nil,
+            request_id: 0,
+            receiver_status: %{},
+            media_status: %{}
     end
 
     @namespace %{
@@ -20,11 +30,23 @@ defmodule Chromecast do
         :youtube => "urn:x-cast:com.google.youtube.mdx",
     }
 
-    def start_link do
-        GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+    def start_link(ip \\ {192,168,1,15}) do
+        GenServer.start_link(__MODULE__, ip)
     end
 
-    def create_message(namespace, payload, destination \\ "receiver-0") when payload |> is_map do
+    def play(device) do
+        GenServer.call(device, :play)
+    end
+
+    def pause(device) do
+        GenServer.call(device, :pause)
+    end
+
+    def set_volume(device, level) do
+        GenServer.call(device, {:set_volume, level})
+    end
+
+    def create_message(namespace, payload, destination) when payload |> is_map do
         Chromecast.CastMessage.new(
             protocol_version: :CASTV2_1_0,
             source_id: "sender-0",
@@ -35,12 +57,121 @@ defmodule Chromecast do
         )
     end
 
-    def play do
-        GenServer.call(__MODULE__, :play)
+    def connect_channel(namespace, state) do
+        con = create_message(:con, %{:type => "CONNECT", :origin => %{}, :requestId => state.request_id}, state.destination_id)
+        state = send_msg(state.ssl, con, state)
+        status = create_message(namespace, %{:type => "GET_STATUS", :requestId => state.request_id}, state.destination_id)
+        state = send_msg(state.ssl, status, state)
     end
 
-    def connect_channel do
-        GenServer.call(__MODULE__, :connect_channel)
+    def send_msg(ssl, msg, state) do
+        case :ssl.send(ssl, encode(msg)) do
+            :ok ->
+                cond do
+                    state.request_id > 2000 -> %State{state | :request_id => 0}
+                    true -> %State{state | :request_id => state.request_id + 1}
+                end
+            {:error, reason} ->
+                Logger.info "SSL Send Error: #{inspect reason}"
+                state
+        end
+    end
+
+    def connect(ip) do
+        {:ok, ssl} = :ssl.connect(ip, 8009, [:binary, {:reuseaddr, true}], :infinity)
+    end
+
+    def init(ip) do
+        {:ok, ssl} = connect(ip)
+        state = %State{:ssl => ssl, :ip => ip}
+        state = connect_channel(:receiver, state)
+        {:ok, state}
+    end
+
+    def handle_call(:play, _from, state) do
+        msg = create_message(:media, %{
+            :mediaSessionId => state.media_session,
+            :requestId => state.request_id,
+            :type => "PLAY"
+        }, state.destination_id)
+        {:reply, :ok, send_msg(state.ssl, msg, state)}
+    end
+
+    def handle_call(:pause, _from, state) do
+        msg = create_message(:media, %{
+            :mediaSessionId => state.media_session,
+            :requestId => state.request_id,
+            :type => "PAUSE"
+        }, state.destination_id)
+        {:reply, :ok, send_msg(state.ssl, msg, state)}
+    end
+
+    def handle_call({:set_volume, level}, _from, state) do
+        msg = create_message(:media, %{
+            :mediaSessionId => state.media_session,
+            :requestId => state.request_id,
+            :type => "VOLUME",
+            :Volume => %{:level => level, :muted => 0}
+        }, state.destination_id) |> IO.inspect
+        {:reply, :ok, send_msg(state.ssl, msg, state)}
+    end
+
+    def handle_info({:ssl_closed, _}, {:sslsocket, _, state}) do
+        Logger.info("SSL Connection Closed. Re-opening...")
+        {:ok, ssl} = connect(state.ip)
+        state = %State{state | :ssl => ssl}
+        state = connect_channel(:receiver, state)
+        {:noreply, state}
+    end
+
+    def handle_info({:ssl, {sslsocket, new_ssl, _}, data}, state) do
+        msg = decode(data)
+        new_state =
+            cond do
+                msg.payload_utf8 != nil ->
+                    payload = Poison.Parser.parse!(msg.payload_utf8)
+                    new_state = handle_payload(payload, state)
+                true -> state
+            end
+        IO.inspect new_state
+        {:noreply, new_state}
+    end
+
+    def handle_payload(%{"type" => @ping} = payload, state) do
+        msg = create_message(:heartbeat, %{:type => @pong}, "receiver-0")
+        state = send_msg(state.ssl, msg, state)
+    end
+
+    def handle_payload(%{"type" => @receiver_status} = payload, state) do
+        case payload["status"]["applications"] do
+            nil -> state
+            other ->
+                app = Enum.at(other, 0)
+                cond do
+                    app["transportId"] != state.destination_id ->
+                        state = %State{state | :destination_id => app["transportId"], :session => app["sessionId"]}
+                        state = connect_channel(:media, state)
+                        %State{state | :receiver_status => payload}
+                    true -> state
+                end
+        end
+    end
+
+    def handle_payload(%{"type" => @media_status} = payload, state) do
+        IO.inspect payload
+        status = Enum.at(payload["status"], 0)
+        status = Map.merge(state.media_status, status)
+        %State{state | :media_status => status, :media_session => status["mediaSessionId"]}
+    end
+
+    def handle_payload(%{"backendData" => status} = payload, state) do
+        IO.inspect payload
+        %State{state | :media_status => payload}
+    end
+
+    def handle_payload(%{} = payload, state) do
+        Logger.info "Unknown Payload: #{inspect payload}"
+        state
     end
 
     def encode(msg) do
@@ -48,65 +179,11 @@ defmodule Chromecast do
         << byte_size(m)::big-unsigned-integer-size(32) >> <> m
     end
 
-    def decode(msg) do
-        << length::big-unsigned-integer-size(32), rest::binary >> = msg
+    def decode(<< length::big-unsigned-integer-size(32), rest::binary >> = msg) when length < 102400 do
         Chromecast.CastMessage.decode(rest)
     end
 
-    def send(msg) do
-        GenServer.call(__MODULE__, {:send, msg})
-    end
-
-    def init(:ok) do
-        {:ok, ssl} = :ssl.connect({192,168,1,138}, 8009, [:binary, {:reuseaddr, true}], :infinity)
-        Process.send_after(self, :connect, 100)
-        {:ok, %State{:ssl => ssl}}
-    end
-
-    def handle_info(:connect, state) do
-        con = create_message(:con, %{:type => "CONNECT", :origin => %{}})
-        :ssl.send(state.ssl, encode(con))
-        status = create_message(:receiver, %{:type => "GET_STATUS", :requestId => 0})
-        :ssl.send(state.ssl, encode(status))
-        {:noreply, state}
-    end
-
-    def handle_call(:connect_channel, _from, state) do
-        con = create_message(:con, %{:type => "CONNECT", :origin => %{}}, state.destination_id)
-        :ssl.send(state.ssl, encode(con))
-        {:reply, :ok, state}
-    end
-
-    def handle_info({:ssl, {sslsocket, new_ssl, _}, data}, state) do
-        msg = decode(data)
-        payload = Poison.Parser.parse!(msg.payload_utf8) |> IO.inspect
-        new_state =
-            case payload do
-                %{ "type" => "PING" } ->
-                    msg = create_message(:heartbeat, %{"type" => "PONG"}) |> encode
-                    case :ssl.send(state.ssl, msg) do
-                        :ok -> nil
-                        {:error, reason} -> Logger.info "Error: #{inspect reason}"
-                    end
-                    state
-                %{ "type" => "RECEIVER_STATUS" } ->
-                    case payload["status"]["applications"] do
-                        nil -> state
-                        other ->
-                            app = Enum.at(other, 0)
-                            %State{state | :destination_id => app["transportId"], :session => app["sessionId"]}
-                    end
-                %{ "type" => "MEDIA_STATUS" } -> state
-                _ -> state
-            end
-        IO.inspect new_state
-        {:noreply, new_state}
-    end
-
-    def handle_info({:ssl_closed, _}, {:sslsocket, _, state}) do
-        Logger.info("SSL Connection Closed. Re-opening...")
-        {:ok, ssl} = :ssl.connect({192,168,1,138}, 8009, [:binary, {:reuseaddr, true}], :infinity)
-        Logger.info("Opened")
-        {:noreply, %State{state | :ssl => ssl}}
+    def decode(<< length::big-unsigned-integer-size(32), rest::binary >> = msg) do
+        Chromecast.CastMessage.decode(msg)
     end
 end
