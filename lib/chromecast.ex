@@ -72,7 +72,7 @@ defmodule Chromecast do
                     true -> %State{state | :request_id => state.request_id + 1}
                 end
             {:error, reason} ->
-                Logger.info "SSL Send Error: #{inspect reason}"
+                Logger.error "SSL Send Error: #{inspect reason}"
                 state
         end
     end
@@ -112,12 +112,12 @@ defmodule Chromecast do
             :requestId => state.request_id,
             :type => "VOLUME",
             :Volume => %{:level => level, :muted => 0}
-        }, state.destination_id) |> IO.inspect
+        }, state.destination_id)
         {:reply, :ok, send_msg(state.ssl, msg, state)}
     end
 
     def handle_info({:ssl_closed, _}, {:sslsocket, _, state}) do
-        Logger.info("SSL Connection Closed. Re-opening...")
+        Logger.debug("SSL Connection Closed. Re-opening...")
         {:ok, ssl} = connect(state.ip)
         state = %State{state | :ssl => ssl}
         state = connect_channel(:receiver, state)
@@ -158,19 +158,17 @@ defmodule Chromecast do
     end
 
     def handle_payload(%{"type" => @media_status} = payload, state) do
-        IO.inspect payload
         status = Enum.at(payload["status"], 0)
         status = Map.merge(state.media_status, status)
         %State{state | :media_status => status, :media_session => status["mediaSessionId"]}
     end
 
     def handle_payload(%{"backendData" => status} = payload, state) do
-        IO.inspect payload
         %State{state | :media_status => payload}
     end
 
     def handle_payload(%{} = payload, state) do
-        Logger.info "Unknown Payload: #{inspect payload}"
+        Logger.debug "Unknown Payload: #{inspect payload}"
         state
     end
 
