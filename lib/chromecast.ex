@@ -46,6 +46,10 @@ defmodule Chromecast do
         GenServer.call(device, {:set_volume, level})
     end
 
+    def state(device) do
+        GenServer.call(device, :state)
+    end
+
     def create_message(namespace, payload, destination) when payload |> is_map do
         Chromecast.CastMessage.new(
             protocol_version: :CASTV2_1_0,
@@ -86,6 +90,10 @@ defmodule Chromecast do
         state = %State{:ssl => ssl, :ip => ip}
         state = connect_channel(:receiver, state)
         {:ok, state}
+    end
+
+    def handle_call(:state, _from, state) do
+        {:reply, state, state}
     end
 
     def handle_call(:play, _from, state) do
