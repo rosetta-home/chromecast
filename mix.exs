@@ -40,6 +40,7 @@ defmodule Chromecast.Mixfile do
     [
         {:exprotobuf, "~> 1.1.0"},
         {:poison, "~> 2.2.0"},
+        {:ex_doc, ">= 0.0.0", only: :dev}
     ]
   end
 end
