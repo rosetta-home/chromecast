@@ -141,7 +141,6 @@ defmodule Chromecast do
                     new_state = handle_payload(payload, state)
                 true -> state
             end
-        IO.inspect new_state
         {:noreply, new_state}
     end
 
