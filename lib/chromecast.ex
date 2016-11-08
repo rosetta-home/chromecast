@@ -124,6 +124,14 @@ defmodule Chromecast do
         {:reply, :ok, send_msg(state.ssl, msg, state)}
     end
 
+    def handle_info({:ssl_closed, _}, state) do
+        Logger.debug("SSL Connection Closed. Re-opening...")
+        {:ok, ssl} = connect(state.ip)
+        state = %State{state | :ssl => ssl}
+        state = connect_channel(:receiver, state)
+        {:noreply, state}
+    end
+
     def handle_info({:ssl_closed, _}, {:sslsocket, _, state}) do
         Logger.debug("SSL Connection Closed. Re-opening...")
         {:ok, ssl} = connect(state.ip)
