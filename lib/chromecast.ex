@@ -17,7 +17,8 @@ defmodule Chromecast do
             ip: nil,
             request_id: 0,
             receiver_status: %{},
-            media_status: %{}
+            media_status: %{},
+            pinged: false
     end
 
     @namespace %{
@@ -82,13 +83,14 @@ defmodule Chromecast do
     end
 
     def connect(ip) do
-        {:ok, ssl} = :ssl.connect(ip, 8009, [:binary, {:reuseaddr, true}], :infinity)
+        {:ok, ssl} = :ssl.connect(ip, 8009, [:binary, {:reuseaddr, true}])
     end
 
     def init(ip) do
         {:ok, ssl} = connect(ip)
         state = %State{:ssl => ssl, :ip => ip}
         state = connect_channel(:receiver, state)
+        state = %State{ state | pinged: check_dead() }
         {:ok, state}
     end
 
@@ -152,8 +154,17 @@ defmodule Chromecast do
         {:noreply, new_state}
     end
 
+    def handle_info(:pinged, state) do
+      Process.exit(self(), :dead)
+      {:noreply, state}
+    end
+
+    def check_dead, do: Process.send_after(self(), :pinged, 10000)
+
     def handle_payload(%{"type" => @ping} = payload, state) do
+        Process.cancel_timer(state.pinged)
         msg = create_message(:heartbeat, %{:type => @pong}, "receiver-0")
+        state = %State{ state | pinged: check_dead }
         state = send_msg(state.ssl, msg, state)
     end
 
