@@ -90,7 +90,7 @@ defmodule Chromecast do
         {:ok, ssl} = connect(ip)
         state = %State{:ssl => ssl, :ip => ip}
         state = connect_channel(:receiver, state)
-        state = %State{ state | pinged: check_dead() }
+        state = %State{ state | pinged: check_dead }
         {:ok, state}
     end
 
@@ -143,15 +143,16 @@ defmodule Chromecast do
     end
 
     def handle_info({:ssl, {sslsocket, new_ssl, _}, data}, state) do
-        msg = decode(data)
-        new_state =
-            cond do
-                msg.payload_utf8 != nil ->
-                    payload = Poison.Parser.parse!(msg.payload_utf8)
-                    new_state = handle_payload(payload, state)
-                true -> state
-            end
-        {:noreply, new_state}
+      Process.cancel_timer(state.pinged)
+      state =
+        case data |> decode do
+          {:error, _} -> state
+          %{payload_utf8: nil} -> state
+          %{payload_utf8: payload} ->
+            Logger.debug("Chromecast Data: #{payload}")
+            payload |> Poison.Parser.parse! |> handle_payload(state)
+        end
+      {:noreply, %State{state | pinged: check_dead()}}
     end
 
     def handle_info(:pinged, state) do
@@ -159,13 +160,11 @@ defmodule Chromecast do
       {:noreply, state}
     end
 
-    def check_dead, do: Process.send_after(self(), :pinged, 10000)
+    def check_dead, do: Process.send_after(self(), :pinged, 20_000)
 
     def handle_payload(%{"type" => @ping} = payload, state) do
-        Process.cancel_timer(state.pinged)
         msg = create_message(:heartbeat, %{:type => @pong}, "receiver-0")
-        state = %State{ state | pinged: check_dead }
-        state = send_msg(state.ssl, msg, state)
+        send_msg(state.ssl, msg, state)
     end
 
     def handle_payload(%{"type" => @receiver_status} = payload, state) do
@@ -184,8 +183,11 @@ defmodule Chromecast do
     end
 
     def handle_payload(%{"type" => @media_status} = payload, state) do
-        status = Enum.at(payload["status"], 0)
-        status = Map.merge(state.media_status, status)
+        status =
+          case Enum.at(payload["status"], 0) do
+            nil -> state.media_status
+            %{} = stat -> Map.merge(state.media_status, stat)
+          end
         %State{state | :media_status => status, :media_session => status["mediaSessionId"]}
     end
 
@@ -203,11 +205,24 @@ defmodule Chromecast do
         << byte_size(m)::big-unsigned-integer-size(32) >> <> m
     end
 
-    def decode(<< length::big-unsigned-integer-size(32), rest::binary >> = msg) when length < 102400 do
+    def decode(<< length::big-unsigned-integer-size(32), rest::binary >> = msg)
+    when length < 102400 do
+      try do
         Chromecast.CastMessage.decode(rest)
+      rescue
+        _ ->
+          Logger.error "ProtoBuf Parse Error: #{inspect msg}"
+          {:error, :parse_error}
+      end
     end
 
     def decode(<< length::big-unsigned-integer-size(32), rest::binary >> = msg) do
+      try do
         Chromecast.CastMessage.decode(msg)
+      rescue
+        _ ->
+          Logger.error "ProtoBuf Parse Error: #{inspect msg}"
+          {:error, :parse_error}
+      end
     end
 end
