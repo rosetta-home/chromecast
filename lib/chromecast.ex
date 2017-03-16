@@ -17,8 +17,7 @@ defmodule Chromecast do
             ip: nil,
             request_id: 0,
             receiver_status: %{},
-            media_status: %{},
-            pinged: false
+            media_status: %{}
     end
 
     @namespace %{
@@ -90,7 +89,6 @@ defmodule Chromecast do
         {:ok, ssl} = connect(ip)
         state = %State{:ssl => ssl, :ip => ip}
         state = connect_channel(:receiver, state)
-        state = %State{ state | pinged: check_dead }
         {:ok, state}
     end
 
@@ -143,7 +141,6 @@ defmodule Chromecast do
     end
 
     def handle_info({:ssl, {sslsocket, new_ssl, _}, data}, state) do
-      Process.cancel_timer(state.pinged)
       state =
         case data |> decode do
           {:error, _} -> state
@@ -152,15 +149,8 @@ defmodule Chromecast do
             Logger.debug("Chromecast Data: #{payload}")
             payload |> Poison.Parser.parse! |> handle_payload(state)
         end
-      {:noreply, %State{state | pinged: check_dead()}}
-    end
-
-    def handle_info(:pinged, state) do
-      Process.exit(self(), :dead)
       {:noreply, state}
     end
-
-    def check_dead, do: Process.send_after(self(), :pinged, 20_000)
 
     def handle_payload(%{"type" => @ping} = payload, state) do
         msg = create_message(:heartbeat, %{:type => @pong}, "receiver-0")
